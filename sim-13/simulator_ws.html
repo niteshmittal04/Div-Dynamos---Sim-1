@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>2D Robot Simulator (WS Integrated)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    /* Keep your original styling mostly intact but trimmed for brevity */
+    body { margin: 0; padding: 15px; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background:#f5f7fa; display:flex; gap:20px; height:100vh; }
+    .simulator-container { width:80%; background:#fff; border-radius:12px; padding:20px; border:1px solid #e1e8ed; display:flex; flex-direction:column; }
+    .canvas-wrapper { flex:1; display:flex; justify-content:center; align-items:center; position:relative; background:#fafbfc; border-radius:8px; padding:15px; margin:15px 0; min-height:600px; }
+    #canvas { border:3px solid #2c3e50; background:#fff; width:100%; height:100%; max-width:700px; max-height:700px; }
+    .goal-reached-message { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); display:none; padding:20px 40px; border-radius:12px; font-size:24px; font-weight:700; color:#fff; background:linear-gradient(135deg,#10b981,#059669); z-index:1000; }
+    .canvas-info { position:absolute; top:10px; left:10px; background:rgba(255,255,255,0.95); padding:8px 12px; border-radius:6px; font-family:Consolas,Monaco,monospace; font-size:11px; color:#374151; border:1px solid #e5e7eb; }
+  </style>
+</head>
+<body>
+  <div class="simulator-container">
+    <h1 style="margin:0 0 10px 0; font-size:28px;">2D Robot Simulator (WS)</h1>
+    <div class="canvas-wrapper">
+      <canvas id="canvas" width="650" height="600"></canvas>
+      <div id="goalReachedMessage" class="goal-reached-message">🎯 GOAL REACHED! 🎯</div>
+      <div id="canvasInfo" class="canvas-info">WS: Disconnected</div>
+    </div>
+  </div>
+
+  <script>
+  // ======= Config =======
+  const WS_URL = "ws://localhost:8080";
+  const CANVAS_W = 650, CANVAS_H = 600;
+  const ROBOT_RADIUS = 18;
+  const MAX_STEP_PER_FRAME = 3.5; // pixels per frame (tune)
+  const REACH_NODE_THRESHOLD = 6;  // px, when we consider a path node reached
+  const SIDESTEP_AMOUNT = 12;      // px for local sidestep when blocked
+  const COLLIDE_BUFFER = 2;        // tolerance to declare collision
+
+  // ======= Canvas & State =======
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+  const canvasInfo = document.getElementById('canvasInfo');
+  const goalReachedMessage = document.getElementById('goalReachedMessage');
+
+  // Local robot state (render-only). The true robot position comes from server state_update.
+  let robot = { x: 320, y: 300, angle: 0, size: ROBOT_RADIUS, moving: false };
+  let goal = { x: 550, y: 80, size: 15 };
+  let obstacles = []; // {x,y,size}
+  let collisionCount = 0;
+  let isRunning = false;
+
+  // Path data: server sends a short lookahead path array in each state_update
+  // format: [{x,y}, ...]. We'll follow nodes sequentially.
+  let path = [];
+  let pathIdx = 0;
+
+  // WebSocket
+  let ws = null;
+  let wsConnected = false;
+
+  function connectWS() {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    ws = new WebSocket(WS_URL);
+    canvasInfo.textContent = "WS: Connecting...";
+    ws.onopen = () => {
+      wsConnected = true;
+      canvasInfo.textContent = "WS: Connected";
+      // request initial start state or let control panel issue start
+    };
+    ws.onclose = () => {
+      wsConnected = false;
+      canvasInfo.textContent = "WS: Disconnected";
+      // Try reconnect with backoff
+      setTimeout(connectWS, 800);
+    };
+    ws.onerror = (e) => {
+      console.warn("WS error", e);
+      wsConnected = false;
+      canvasInfo.textContent = "WS: Error";
+    };
+    ws.onmessage = (evt) => {
+      try {
+        const msg = JSON.parse(evt.data);
+        handleServerMessage(msg);
+      } catch (e) {
+        console.warn("Invalid WS message", e);
+      }
+    };
+  }
+
+  function handleServerMessage(msg) {
+    if (msg.type === "state_update") {
+      // update positions
+      if (msg.robot) {
+        robot.x = msg.robot.x;
+        robot.y = msg.robot.y;
+      }
+      if (msg.goal) {
+        goal.x = msg.goal.x;
+        goal.y = msg.goal.y;
+      }
+      obstacles = msg.obstacles || [];
+      collisionCount = msg.collision_count || collisionCount;
+      isRunning = !!msg.is_running;
+
+      // server provides a short lookahead path (in pixels)
+      if (msg.path && msg.path.length > 0) {
+        path = msg.path.map(p => ({ x: p[0] === undefined ? p.x : p[0], y: p[1] === undefined ? p.y : p[1] }));
+        // If our current path index is out of bounds, reset
+        if (pathIdx >= path.length) pathIdx = 0;
+      } else {
+        // no path provided: keep current path if any, or empty
+        // this can happen when server hasn't planned yet
+      }
+    } else if (msg.type === "collision") {
+      collisionCount++;
+      // briefly flash
+      flashCollision();
+    } else if (msg.type === "goal_reached") {
+      showGoalReachedMessage();
+      isRunning = false;
+    } else if (msg.type === "reset_ack") {
+      // reset local state visuals
+      collisionCount = 0;
+      path = [];
+      pathIdx = 0;
+    }
+  }
+
+  // Local utility: will a point collide with any obstacle?
+  function willCollideAt(x, y) {
+    for (const o of obstacles) {
+      const d = Math.hypot(x - o.x, y - o.y);
+      if (d < (ROBOT_RADIUS + (o.size || 20)/2) - COLLIDE_BUFFER) return true;
+    }
+    return false;
+  }
+
+  // follow server-sent path nodes locally to provide smooth animation between server ticks
+  function followPathStep() {
+    if (!path || path.length === 0) return;
+    if (pathIdx >= path.length) return;
+
+    const node = path[pathIdx];
+    const dx = node.x - robot.x;
+    const dy = node.y - robot.y;
+    const dist = Math.hypot(dx, dy);
+
+    // If node reached, advance index
+    if (dist < REACH_NODE_THRESHOLD) {
+      pathIdx++;
+      if (pathIdx >= path.length) {
+        // reached lookahead path; wait for server to send new path
+        return;
+      }
+    } else {
+      // compute step
+      const step = Math.min(MAX_STEP_PER_FRAME, dist);
+      let nx = robot.x + (dx / dist) * step;
+      let ny = robot.y + (dy / dist) * step;
+
+      // immediate collision check
+      if (willCollideAt(nx, ny)) {
+        // try perpendicular sidestep (local escape) without changing server path index
+        // choose perpendicular direction that is free
+        const perp1 = { x: robot.x + (-dy / (dist || 1)) * SIDESTEP_AMOUNT, y: robot.y + (dx / (dist || 1)) * SIDESTEP_AMOUNT };
+        const perp2 = { x: robot.x + (dy / (dist || 1)) * SIDESTEP_AMOUNT, y: robot.y + (-dx / (dist || 1)) * SIDESTEP_AMOUNT };
+        if (!willCollideAt(perp1.x, perp1.y)) { nx = perp1.x; ny = perp1.y; }
+        else if (!willCollideAt(perp2.x, perp2.y)) { nx = perp2.x; ny = perp2.y; }
+        else {
+          // if both blocked, take a tiny random jitter to escape local trap
+          nx = robot.x + (Math.random() - 0.5) * 6;
+          ny = robot.y + (Math.random() - 0.5) * 6;
+        }
+        // we do not advance node; server replan will come in a tick
+      }
+
+      // commit move locally for smoothness (server is authoritative: it will also move robot)
+      robot.x = clamp(nx, 0, CANVAS_W);
+      robot.y = clamp(ny, 0, CANVAS_H);
+      robot.angle = Math.atan2(dy, dx) * 180 / Math.PI;
+    }
+  }
+
+  // small utility clamp
+  function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+  // draw everything
+  function draw() {
+    // background
+    const g = ctx.createLinearGradient(0,0,CANVAS_W,CANVAS_H);
+    g.addColorStop(0, '#f8fafc'); g.addColorStop(1, '#f1f5f9');
+    ctx.fillStyle = g; ctx.fillRect(0,0,CANVAS_W,CANVAS_H);
+
+    // grid
+    ctx.strokeStyle = '#e9ecef'; ctx.lineWidth = 1;
+    for (let x=0;x<=CANVAS_W;x+=50){ ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,CANVAS_H); ctx.stroke(); }
+    for (let y=0;y<=CANVAS_H;y+=50){ ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(CANVAS_W,y); ctx.stroke(); }
+
+    // draw obstacles
+    for (const o of obstacles) {
+      ctx.fillStyle = '#2f3542';
+      ctx.fillRect(o.x - (o.size||25)/2, o.y - (o.size||25)/2, (o.size||25), (o.size||25));
+      ctx.strokeStyle = '#57606f'; ctx.strokeRect(o.x - (o.size||25)/2, o.y - (o.size||25)/2, (o.size||25), (o.size||25));
+    }
+
+    // draw provided path (remaining)
+    if (path && path.length > 0) {
+      ctx.beginPath();
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = '#3b82f6';
+      const startIdx = Math.max(0, pathIdx);
+      ctx.moveTo(robot.x, robot.y);
+      for (let i=startIdx;i<path.length;i++) {
+        ctx.lineTo(path[i].x, path[i].y);
+      }
+      ctx.stroke();
+
+      // draw nodes
+      for (let i=startIdx;i<path.length;i++){
+        ctx.fillStyle = i===pathIdx ? '#2563eb' : '#93c5fd';
+        ctx.beginPath(); ctx.arc(path[i].x, path[i].y, 4, 0, 2*Math.PI); ctx.fill();
+      }
+    }
+
+    // draw goal
+    ctx.fillStyle = '#2ed573';
+    ctx.fillRect(goal.x - goal.size, goal.y - goal.size, goal.size*2, goal.size*2);
+    ctx.strokeStyle = '#0d7a2e'; ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(goal.x, goal.y-goal.size); ctx.lineTo(goal.x, goal.y+goal.size+10); ctx.stroke();
+
+    // draw robot
+    ctx.save();
+    ctx.translate(robot.x, robot.y);
+    ctx.rotate(robot.angle * Math.PI / 180);
+    const gradient = ctx.createRadialGradient(0,0,0,0,0,robot.size);
+    gradient.addColorStop(0, '#ff6b6b'); gradient.addColorStop(1, '#ee5a52');
+    ctx.fillStyle = gradient; ctx.beginPath(); ctx.arc(0,0,robot.size,0,2*Math.PI); ctx.fill();
+    ctx.strokeStyle = '#c44569'; ctx.lineWidth = 2; ctx.stroke();
+    ctx.fillStyle = '#ffffff'; ctx.beginPath(); ctx.moveTo(robot.size-5,0); ctx.lineTo(robot.size-15,-5); ctx.lineTo(robot.size-15,5); ctx.fill();
+    ctx.restore();
+
+    // HUD
+    ctx.fillStyle = '#111827';
+    ctx.font = '12px Consolas, monospace';
+    ctx.fillText(`Collisions: ${collisionCount}`, 12, CANVAS_H - 10);
+  }
+
+  // small UI helpers
+  function showGoalReachedMessage() {
+    goalReachedMessage.style.display = 'block';
+    setTimeout(() => { goalReachedMessage.style.display = 'none'; }, 3000);
+  }
+  function flashCollision() {
+    canvas.style.filter = 'brightness(0.85) saturate(0.9)';
+    setTimeout(() => canvas.style.filter = '', 200);
+  }
+
+  // request replan (fire-and-forget) — server replans periodically automatically,
+  // but we can nudge it by sending a "start" command if needed.
+  function requestReplan() {
+    if (ws && wsConnected) {
+      try {
+        ws.send(JSON.stringify({ type: "start", timestamp: Date.now() })); // server will set is_running true and replan
+      } catch (e) { /* ignore */ }
+    }
+  }
+
+  // animation loop
+  function loop() {
+    // Smoothly follow server path locally for frame-rate animation
+    followPathStep();
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // start
+  connectWS();
+  loop();
+  </script>
+</body>
+</html>
